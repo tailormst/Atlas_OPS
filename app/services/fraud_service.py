@@ -11,9 +11,11 @@ import numpy as np
 from app.core.logging import get_logger
 from app.services.ml_loader import (
     FRAUD_FEATURES,
+    FRAUD_FEATURE_DEFAULTS,
     get_models,
     safe_label_encode,
     scale_features,
+    fill_missing_features,
 )
 
 logger = get_logger(__name__)
@@ -27,31 +29,47 @@ class FraudService:
         """
         Map a normalised features dict to a numpy row using FRAUD_FEATURES order.
         Applies real LabelEncoders for strings and StandardScaler for numericals.
+
+        NEVER crashes — fills missing features with risk-aware defaults.
         """
         models = get_models()
 
-        # 1. Apply Label Encoding to known string fields
-        # Note: features dict uses 'P_emaildomain', encoders dict uses 'email_domain'
-        if "P_emaildomain" in features:
+        # 1. Fill any missing features with intelligent defaults
+        features = fill_missing_features(features, FRAUD_FEATURE_DEFAULTS, FRAUD_FEATURES)
+
+        # 2. Apply Label Encoding to known string fields
+        if "P_emaildomain" in features and isinstance(features["P_emaildomain"], str):
             features["P_emaildomain"] = safe_label_encode(
-                models.label_encoders.get("email_domain"), features["P_emaildomain"]
+                models.label_encoders.get("email_domain")
+                or models.label_encoders.get("P_emaildomain"),
+                features["P_emaildomain"],
             )
-        if "DeviceType" in features:
+        if "DeviceType" in features and isinstance(features["DeviceType"], str):
             features["DeviceType"] = safe_label_encode(
-                models.label_encoders.get("device_type"), features["DeviceType"]
+                models.label_encoders.get("device_type")
+                or models.label_encoders.get("DeviceType"),
+                features["DeviceType"],
             )
-        if "DeviceInfo" in features:
+        if "DeviceInfo" in features and isinstance(features["DeviceInfo"], str):
             features["DeviceInfo"] = safe_label_encode(
-                models.label_encoders.get("device_info"), features["DeviceInfo"]
+                models.label_encoders.get("device_info")
+                or models.label_encoders.get("DeviceInfo"),
+                features["DeviceInfo"],
             )
 
-        # 2. Scale features
+        # 3. Scale numerical features
         scaled_features = scale_features(models.standard_scaler, features)
 
+        # 4. Build row in exact FRAUD_FEATURES order
         row = []
         for fname in FRAUD_FEATURES:
             val = scaled_features.get(fname, 0)
-            row.append(float(val))
+            try:
+                row.append(float(val))
+            except (ValueError, TypeError):
+                logger.warning("fraud_feature_cast_failed", feature=fname, value=val)
+                row.append(0.0)
+
         return np.array([row])
 
     @staticmethod
@@ -74,9 +92,9 @@ class FraudService:
             # proba shape: (n_classes,)  — index 1 = P(fraud)
             fraud_prob = float(proba[1]) if len(proba) > 1 else float(proba[0])
         except Exception as exc:
-            logger.error("fraud_model_prediction_failed", error=str(exc))
-            # Safe operational fallback if model prediction crashes
-            fraud_prob = 0.5
+            logger.error("fraud_model_prediction_failed", error=str(exc), exc_info=True)
+            # Conservative fallback — flag as medium-high risk so it's NOT auto-approved
+            fraud_prob = 0.55
 
         # ── SHAP ─────────────────────────────────────────────────────────────
         shap_dict: dict[str, float] = {}
@@ -95,15 +113,55 @@ class FraudService:
                 }
             except Exception as exc:
                 logger.warning("fraud_shap_failed", error=str(exc))
-                shap_dict = {feat: 0.0 for feat in FRAUD_FEATURES}
+                # Generate synthetic SHAP from feature values for explanation
+                shap_dict = FraudService._synthetic_shap(features)
         else:
-            shap_dict = {feat: 0.0 for feat in FRAUD_FEATURES}
+            # No explainer — generate synthetic feature importance
+            shap_dict = FraudService._synthetic_shap(features)
 
         logger.info(
             "fraud_scored",
             fraud_probability=round(fraud_prob, 4),
+            is_stub=models.fraud_is_stub,
             top_feature=max(shap_dict, key=lambda k: abs(shap_dict[k]))
             if shap_dict
             else "n/a",
         )
         return fraud_prob, shap_dict
+
+    @staticmethod
+    def _synthetic_shap(features: dict[str, Any]) -> dict[str, float]:
+        """
+        Generate synthetic SHAP-like values based on feature deviation from
+        'normal' baselines. Used when real SHAP is unavailable.
+        """
+        baselines = {
+            "TransactionAmt": 100.0,
+            "card1": 10000,
+            "card2": 200,
+            "P_emaildomain": 0,
+            "addr1": 200,
+            "addr2": 50,
+            "DeviceType": 0,
+            "DeviceInfo": 0,
+            "dist1": 10.0,
+            "dist2": 5.0,
+        }
+        shap_vals = {}
+        for feat in FRAUD_FEATURES:
+            val = features.get(feat, 0)
+            baseline = baselines.get(feat, 0)
+            try:
+                val_f = float(val)
+                base_f = float(baseline)
+                if feat == "TransactionAmt":
+                    # Positive = increases fraud risk
+                    shap_vals[feat] = round(max(0, (val_f - 200) / 5000), 6)
+                elif feat in ("dist1", "dist2"):
+                    shap_vals[feat] = round(max(0, (val_f - 20) / 500), 6)
+                else:
+                    diff = (val_f - base_f) / max(abs(base_f), 1)
+                    shap_vals[feat] = round(diff * 0.05, 6)
+            except (ValueError, TypeError):
+                shap_vals[feat] = 0.0
+        return shap_vals

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.router import v1_router
+from app.api.router import api_router
 from app.core.circuit_breaker import circuit_breakers
 from app.core.config import get_settings
 from app.core.database import create_all_tables
@@ -86,11 +86,12 @@ app.add_middleware(
 app.add_middleware(IdempotencyMiddleware)
 
 # ── Routes ───────────────────────────────────────────────────────────────────
-app.include_router(v1_router, prefix="/v1")
+# api_router already has prefix="/v1", so mount at root
+app.include_router(api_router)
 
 
 @app.get(
-    "/health",
+    "/v1/health",
     response_model=HealthCheckResponse,
     tags=["Health"],
     summary="Service health check",

@@ -1,6 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# ATLAS-OPS Docker Compose — Redis Only
-# PostgreSQL runs locally via pgAdmin / native install
+# ATLAS-OPS Docker Compose
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -20,5 +19,25 @@ services:
       timeout: 5s
       retries: 5
 
+  # ─── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: atlas_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: atlas_ops
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d atlas_ops"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
 volumes:
   redis_data:
+  pg_data:

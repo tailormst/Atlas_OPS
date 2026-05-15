@@ -34,6 +34,16 @@ class GatewaySimulator:
             confirmation dict
         """
         redis = get_redis_pool()
+        if redis is None:
+            logger.warning("outage_sim_no_redis", gateway=gateway)
+            return {
+                "gateway": gateway,
+                "failure_rate": failure_rate,
+                "duration_seconds": duration_seconds,
+                "circuit_opened": False,
+                "message": "Redis unavailable — simulation not stored. Circuit breaker may still be opened.",
+            }
+
         sim_key = f"sim:outage:{gateway}"
 
         payload = json.dumps({
@@ -43,7 +53,10 @@ class GatewaySimulator:
             "duration_seconds": duration_seconds,
         })
 
-        await redis.setex(sim_key, duration_seconds, payload)
+        try:
+            await redis.setex(sim_key, duration_seconds, payload)
+        except Exception as exc:
+            logger.warning("outage_sim_redis_write_failed", gateway=gateway, error=str(exc))
 
         # If failure_rate > 0.5 → also force-open the circuit breaker
         circuit_opened = False
@@ -78,7 +91,11 @@ class GatewaySimulator:
     async def clear_simulation(gateway: str) -> None:
         """Remove an active outage simulation and reset the circuit."""
         redis = get_redis_pool()
-        await redis.delete(f"sim:outage:{gateway}")
+        if redis is not None:
+            try:
+                await redis.delete(f"sim:outage:{gateway}")
+            except Exception as exc:
+                logger.warning("outage_sim_clear_failed", gateway=gateway, error=str(exc))
         try:
             circuit_breakers.force_close(gateway)
         except Exception:

@@ -21,8 +21,8 @@ pybreaker==1.2.0
 # ML / AI
 scikit-learn==1.6.0
 xgboost==2.1.3
-shap==0.46.0
-numpy==1.26.4
+shap
+numpy==2.1.0
 pandas==2.2.3
 
 # LLM / RAG
@@ -35,6 +35,10 @@ openai==1.61.0
 pydantic==2.10.4
 pydantic-settings==2.7.0
 python-dotenv==1.0.1
+
+# Auth
+bcrypt
+python-jose[cryptography]
 
 # Logging
 structlog==24.4.0

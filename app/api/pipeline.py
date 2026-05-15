@@ -4,6 +4,8 @@ POST /v1/transaction/process-live
 Server-Sent Events endpoint that streams all 16 pipeline stages in real time
 as a transaction is processed. Frontend connects and receives stage-by-stage
 updates for animated pipeline visualization.
+
+Includes REROUTE logic: if primary gateway fails, attempts next-best gateway.
 """
 
 import json
@@ -164,8 +166,18 @@ async def _process_pipeline(
         })
         await asyncio.sleep(0.08)
 
-        # Stage 14: RAG skipped
-        yield _sse_event(14, "RAG/LLM Explanation", "skipped", {"reason": "No gateway failure to explain"})
+        # Stage 14: RAG explanation for fraud rejection
+        yield _sse_event(14, "RAG/LLM Explanation", "active", {"message": "Generating fraud rejection explanation..."})
+        fraud_explanation = await RAGExplainerService.explain_fraud_rejection(
+            transaction_id=str(txn_id),
+            fraud_prob=fraud_prob,
+            shap_values=fraud_shap,
+            features=fraud_features,
+        )
+        yield _sse_event(14, "RAG/LLM Explanation", "completed", {
+            "explanation_length": len(fraud_explanation),
+            "explanation": fraud_explanation,
+        })
         await asyncio.sleep(0.05)
 
         # Stage 15: DB Persistence
@@ -180,6 +192,7 @@ async def _process_pipeline(
             "status": "REJECTED",
             "fraud_score": round(fraud_prob, 4),
             "fraud_flag": True,
+            "explanation": fraud_explanation,
             "elapsed_ms": elapsed,
         })
         return
@@ -284,7 +297,7 @@ async def _process_pipeline(
         })
         return
 
-    # ── Failure Path ──────────────────────────────────────────────────────
+    # ── Primary Gateway Failed — Try REROUTE ─────────────────────────────
     yield _sse_event(10, "Gateway Execution", "failed", {
         "gateway": selected_gateway,
         "latency_ms": gw_latency,
@@ -293,6 +306,71 @@ async def _process_pipeline(
     await asyncio.sleep(0.08)
 
     gateway_error = gateway_result.get("gateway_error", {})
+
+    # Attempt reroute to next-best gateway
+    reroute_gateway = None
+    reroute_result = None
+    sorted_gateways = sorted(
+        [(gw, s) for gw, s in gateway_scores.items() if s >= 0 and gw != selected_gateway],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    if sorted_gateways:
+        reroute_gateway = sorted_gateways[0][0]
+        yield _sse_event(10, "Gateway Execution", "active", {
+            "gateway": reroute_gateway,
+            "message": f"REROUTING to {reroute_gateway.upper()}...",
+            "rerouted_from": selected_gateway,
+        })
+        await asyncio.sleep(0.1)
+
+        reroute_result = await GatewayService.execute(reroute_gateway, fraud_features, db)
+
+        if reroute_result["success"]:
+            transaction.status = TransactionStatus.REROUTED
+            transaction.selected_gateway = reroute_gateway
+            transaction.rerouted_from = selected_gateway
+            transaction.gateway_response = reroute_result["gateway_response"]
+
+            yield _sse_event(10, "Gateway Execution", "completed", {
+                "gateway": reroute_gateway,
+                "rerouted_from": selected_gateway,
+                "latency_ms": reroute_result.get("latency_ms", 0),
+            })
+            await asyncio.sleep(0.06)
+
+            # Stage 11: Gateway Response (rerouted success)
+            yield _sse_event(11, "Gateway Response", "completed", {
+                "http_status": 200,
+                "gateway_txn_id": reroute_result["gateway_response"].get("gateway_transaction_id", ""),
+                "rerouted": True,
+            })
+            await asyncio.sleep(0.06)
+
+            yield _sse_event(12, "Failure Analysis", "skipped", {"reason": "Reroute succeeded"})
+            await asyncio.sleep(0.05)
+            yield _sse_event(13, "SHAP Explainability", "completed", {"shap_values": fraud_shap})
+            await asyncio.sleep(0.06)
+            yield _sse_event(14, "RAG/LLM Explanation", "skipped", {"reason": "Reroute succeeded"})
+            await asyncio.sleep(0.05)
+
+            await db.commit()
+            yield _sse_event(15, "Database Persistence", "completed", {"rows_written": 2})
+            await asyncio.sleep(0.06)
+
+            elapsed = round((time.monotonic() - pipeline_start) * 1000, 1)
+            yield _sse_event(16, "Final Transaction Result", "completed", {
+                "transaction_id": str(txn_id),
+                "status": "REROUTED",
+                "fraud_score": round(fraud_prob, 4),
+                "selected_gateway": reroute_gateway,
+                "rerouted_from": selected_gateway,
+                "elapsed_ms": elapsed,
+            })
+            return
+
+    # ── Full Failure Path ─────────────────────────────────────────────────
 
     # Stage 11: Gateway Response (error)
     yield _sse_event(11, "Gateway Response", "failed", {
@@ -334,8 +412,13 @@ async def _process_pipeline(
     })
     await asyncio.sleep(0.08)
 
+    # Determine final status
+    if gateway_error.get("timeout_flag"):
+        transaction.status = TransactionStatus.TIMEOUT
+    else:
+        transaction.status = TransactionStatus.FAILED
+
     # Stage 15: DB Persistence
-    transaction.status = TransactionStatus.FAILED
     transaction.gateway_response = gateway_error
     db.add(MLResult(
         transaction_id=txn_id,
@@ -352,9 +435,10 @@ async def _process_pipeline(
 
     # Stage 16: Final Result
     elapsed = round((time.monotonic() - pipeline_start) * 1000, 1)
+    final_status = transaction.status.value
     yield _sse_event(16, "Final Transaction Result", "completed", {
         "transaction_id": str(txn_id),
-        "status": "FAILED",
+        "status": final_status,
         "fraud_score": round(fraud_prob, 4),
         "selected_gateway": selected_gateway,
         "gateway_latency_ms": gw_latency,

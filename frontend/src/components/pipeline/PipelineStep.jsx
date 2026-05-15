@@ -165,16 +165,29 @@ function renderStageData(stage) {
   }
 
   if (stage.id === 16) {
+    const statusColors = {
+      'APPROVED': 'text-emerald-400',
+      'REJECTED': 'text-red-400',
+      'FAILED': 'text-orange-400',
+      'REROUTED': 'text-atlas-400',
+      'TIMEOUT': 'text-amber-400',
+      'RETRIED': 'text-cyan-400',
+    }
     return (
-      <div className="flex items-center gap-4">
-        <span className={`text-lg font-bold ${
-          d.status === 'APPROVED' ? 'text-emerald-400' :
-          d.status === 'REJECTED' ? 'text-red-400' : 'text-orange-400'
-        }`}>
-          {d.status}
-        </span>
-        {d.elapsed_ms && (
-          <span className="text-xs text-slate-500 font-mono">{d.elapsed_ms}ms total</span>
+      <div className="space-y-2">
+        <div className="flex items-center gap-4">
+          <span className={`text-lg font-bold ${statusColors[d.status] || 'text-orange-400'}`}>
+            {d.status}
+          </span>
+          {d.elapsed_ms && (
+            <span className="text-xs text-slate-500 font-mono">{d.elapsed_ms}ms total</span>
+          )}
+        </div>
+        {d.rerouted_from && (
+          <p className="text-[10px] text-atlas-400">Rerouted from {d.rerouted_from.toUpperCase()}</p>
+        )}
+        {d.explanation && (
+          <p className="text-[10px] text-slate-500 truncate max-w-md">{d.explanation.slice(0, 120)}…</p>
         )}
       </div>
     )

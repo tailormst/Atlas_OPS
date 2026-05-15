@@ -15,10 +15,7 @@ logger = get_logger(__name__)
 
 engine = create_async_engine(
     settings.database_url,
-    echo=settings.app_env == "development",
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True,
+    echo=False,
 )
 
 AsyncSessionLocal = async_sessionmaker(
@@ -65,11 +62,16 @@ async def create_all_tables() -> None:
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency: yields an async DB session."""
+    """
+    FastAPI dependency: yields an async DB session.
+
+    NOTE: Does NOT auto-commit. Endpoints must call await session.commit()
+    explicitly. This prevents double-commit issues with SSE pipeline
+    which commits at specific stages.
+    """
     async with AsyncSessionLocal() as session:
         try:
             yield session
-            await session.commit()
         except Exception:
             await session.rollback()
             raise

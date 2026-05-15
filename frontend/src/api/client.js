@@ -1,24 +1,56 @@
 /**
  * ATLAS-OPS API Client
  * Central fetch wrapper for all backend API calls.
+ * Includes auth header injection and idempotency key generation.
  */
 
 const API_BASE = '/v1'
 
+function getAuthToken() {
+  return localStorage.getItem('atlas_token')
+}
+
+function generateIdempotencyKey() {
+  return crypto.randomUUID ? crypto.randomUUID() : 
+    'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = Math.random() * 16 | 0
+      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16)
+    })
+}
+
 async function request(endpoint, options = {}) {
   const url = endpoint.startsWith('http') ? endpoint : `${API_BASE}${endpoint}`
   
-  const config = {
-    headers: {
-      'Content-Type': 'application/json',
-      ...options.headers,
-    },
-    ...options,
+  const headers = {
+    'Content-Type': 'application/json',
+    ...options.headers,
   }
+
+  // Inject auth token
+  const token = getAuthToken()
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+
+  // Auto-add idempotency key for POST requests
+  if (options.method === 'POST' && !headers['Idempotency-Key']) {
+    headers['Idempotency-Key'] = generateIdempotencyKey()
+  }
+
+  const config = { ...options, headers }
 
   try {
     const response = await fetch(url, config)
     
+    if (response.status === 401) {
+      // Token expired — clear auth
+      localStorage.removeItem('atlas_token')
+      localStorage.removeItem('atlas_refresh')
+      localStorage.removeItem('atlas_user')
+      window.location.href = '/login'
+      throw new Error('Session expired. Please login again.')
+    }
+
     if (!response.ok) {
       const error = await response.json().catch(() => ({ detail: response.statusText }))
       throw new Error(error.detail || `HTTP ${response.status}`)
@@ -34,6 +66,21 @@ async function request(endpoint, options = {}) {
 }
 
 export const api = {
+  // Auth
+  login: (email, password, adminKey) =>
+    request('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password, admin_key: adminKey || undefined }),
+    }),
+
+  refreshToken: (refreshToken) =>
+    request('/auth/refresh', {
+      method: 'POST',
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    }),
+
+  getMe: () => request('/auth/me'),
+
   // Health
   health: () => request('/health'),
 
@@ -43,6 +90,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+
+  listTransactions: (page = 1, perPage = 20, status = null) => {
+    let url = `/transactions?page=${page}&per_page=${perPage}`
+    if (status) url += `&status=${status}`
+    return request(url)
+  },
 
   // Gateway Health
   getGatewayHealth: () => request('/gateways/health'),
@@ -75,9 +128,18 @@ export const api = {
 export function connectPipelineSSE(transactionData, onEvent, onError, onComplete) {
   const controller = new AbortController()
 
+  const headers = {
+    'Content-Type': 'application/json',
+    'Idempotency-Key': generateIdempotencyKey(),
+  }
+  const token = getAuthToken()
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+
   fetch(`${API_BASE}/transaction/process-live`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(transactionData),
     signal: controller.signal,
   })

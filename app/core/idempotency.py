@@ -7,6 +7,7 @@ On every POST request:
   3. After handler completes → cache the response body in Redis (TTL = 24 h).
 
 Only POST endpoints are subject to idempotency checks.
+SSE (text/event-stream) responses are NEVER cached — they are streaming.
 """
 
 import json
@@ -25,6 +26,9 @@ logger = get_logger(__name__)
 IDEMPOTENCY_HEADER = "Idempotency-Key"
 IDEMPOTENCY_TTL = 86400  # 24 hours
 
+# Paths that use SSE/streaming and must NOT be cached
+_STREAMING_PATHS = {"/v1/transaction/process-live"}
+
 
 class IdempotencyMiddleware(BaseHTTPMiddleware):
     def __init__(self, app: ASGIApp) -> None:
@@ -33,6 +37,10 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         # Apply only to POST
         if request.method != "POST":
+            return await call_next(request)
+
+        # Skip streaming endpoints entirely
+        if request.url.path in _STREAMING_PATHS:
             return await call_next(request)
 
         idempotency_key = request.headers.get(IDEMPOTENCY_HEADER)
@@ -48,7 +56,12 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
         cache_key = f"idempotency:{idempotency_key}"
 
         # ── 1. CHECK CACHE ─────────────────────────────
-        cached = await redis.get(cache_key)
+        try:
+            cached = await redis.get(cache_key)
+        except Exception as exc:
+            logger.warning("idempotency_redis_read_failed", error=str(exc))
+            cached = None
+
         if cached:
             logger.info(
                 "idempotency_cache_hit",
@@ -58,7 +71,6 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
             try:
                 payload = json.loads(cached)
 
-                # ✅ Safe copy
                 body = payload.get("body", {})
                 if isinstance(body, dict):
                     body = dict(body)  # avoid mutation
@@ -75,6 +87,11 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
         # ── 2. PROCESS REQUEST ─────────────────────────
         response = await call_next(request)
 
+        # Only cache JSON responses (not streaming, not files)
+        content_type = response.headers.get("content-type", "")
+        if "application/json" not in content_type:
+            return response
+
         # Read response body
         body_bytes = b""
         async for chunk in response.body_iterator:
@@ -85,10 +102,7 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
             body_json = json.loads(body_bytes.decode("utf-8"))
 
             if isinstance(body_json, dict):
-                # ✅ ensure flag is False for fresh response
                 body_json["idempotency_cached"] = False
-
-                # update response body so client sees it immediately
                 body_bytes = json.dumps(body_json).encode("utf-8")
 
             cache_payload = json.dumps(

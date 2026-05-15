@@ -1,15 +1,15 @@
 """
-API Router — mounts all v1 endpoints under /v1 prefix.
+ATLAS-OPS API Router — mounts all endpoint sub-routers under /v1.
 """
 from fastapi import APIRouter
 
-from app.api import explain, gateways, ml, pipeline, simulate, transaction
+from app.api import auth, gateways, ml, pipeline, simulate, transaction
 
-v1_router = APIRouter()
+api_router = APIRouter(prefix="/v1")
 
-v1_router.include_router(transaction.router)
-v1_router.include_router(pipeline.router)
-v1_router.include_router(explain.router)
-v1_router.include_router(gateways.router)
-v1_router.include_router(simulate.router)
-v1_router.include_router(ml.router)
+api_router.include_router(auth.router)
+api_router.include_router(transaction.router)
+api_router.include_router(pipeline.router)
+api_router.include_router(gateways.router)
+api_router.include_router(simulate.router)
+api_router.include_router(ml.router)

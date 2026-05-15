@@ -8,6 +8,9 @@ export default function StatusBadge({ status, children }) {
     APPROVED: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/20',
     REJECTED: 'bg-red-500/15 text-red-400 border border-red-500/20',
     FAILED: 'bg-orange-500/15 text-orange-400 border border-orange-500/20',
+    REROUTED: 'bg-atlas-500/15 text-atlas-400 border border-atlas-500/20',
+    TIMEOUT: 'bg-amber-500/15 text-amber-400 border border-amber-500/20',
+    RETRIED: 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/20',
     PENDING: 'bg-slate-500/10 text-slate-500 border border-slate-500/10',
     healthy: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/20',
     degraded: 'bg-amber-500/15 text-amber-400 border border-amber-500/20',
@@ -16,6 +19,7 @@ export default function StatusBadge({ status, children }) {
     'half-open': 'bg-amber-500/15 text-amber-400 border border-amber-500/20',
     loaded: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/20',
     fallback: 'bg-amber-500/15 text-amber-400 border border-amber-500/20',
+    unknown: 'bg-slate-500/10 text-slate-500 border border-slate-500/10',
   }
 
   return (

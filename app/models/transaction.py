@@ -16,6 +16,9 @@ class TransactionStatus(str, Enum):
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
     FAILED = "FAILED"
+    REROUTED = "REROUTED"
+    TIMEOUT = "TIMEOUT"
+    RETRIED = "RETRIED"
 
 
 class Transaction(SQLModel, table=True):
@@ -46,6 +49,7 @@ class Transaction(SQLModel, table=True):
 
     # ── Routing & Gateway ─────────────────────────────────────────────────────
     selected_gateway: Optional[str] = Field(default=None, max_length=64)
+    rerouted_from: Optional[str] = Field(default=None, max_length=64)
     gateway_response: Optional[dict[str, Any]] = Field(
         default=None, sa_column=Column(JSON)
     )

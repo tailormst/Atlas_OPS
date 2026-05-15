@@ -58,7 +58,7 @@ async def _update_gateway_health(
     if not success:
         gw.failed_requests += 1
     gw.success_rate = round(
-        1.0 - (gw.failed_requests / gw.total_requests), 4
+        1.0 - (gw.failed_requests / max(gw.total_requests, 1)), 4
     )
     # Rolling average latency
     alpha = 0.2  # exponential moving average factor
@@ -79,7 +79,8 @@ async def _simulate_gateway_call(
 ) -> dict[str, Any]:
     """
     Simulate a real gateway HTTP call.
-    Adds realistic latency (50–800 ms) and occasional random failures.
+    Reads outage simulation config from Redis.
+    Adds realistic latency and failure behavior.
     """
     redis = get_redis_pool()
     sim_key = f"sim:outage:{gateway_name}"
@@ -91,24 +92,43 @@ async def _simulate_gateway_call(
             pass
 
     failure_rate = 0.05  # 5% baseline failure rate
+    extra_latency = 0
     if sim_data:
         import json
-        sim = json.loads(sim_data)
-        failure_rate = float(sim.get("failure_rate", failure_rate))
+        try:
+            sim = json.loads(sim_data)
+            failure_rate = float(sim.get("failure_rate", failure_rate))
+            extra_latency = float(sim.get("extra_latency_ms", 0))
+            logger.info(
+                "outage_sim_active",
+                gateway=gateway_name,
+                failure_rate=failure_rate,
+            )
+        except (json.JSONDecodeError, ValueError):
+            pass
 
-    # Simulate latency
-    latency = random.uniform(50, 800 + failure_rate * 2000)
-    await asyncio.sleep(latency / 1000)
+    # Simulate latency — higher failure rate = higher latency
+    base_latency = random.uniform(50, 400)
+    sim_latency = failure_rate * random.uniform(500, 2000) + extra_latency
+    total_latency = base_latency + sim_latency
+    await asyncio.sleep(total_latency / 1000)
 
+    # Determine if this call fails
     if random.random() < failure_rate:
         error_type = random.choice(["timeout", "connection_drop", "dns_failure", "http_error"])
+        logger.warning(
+            "simulated_gateway_failure",
+            gateway=gateway_name,
+            error_type=error_type,
+            failure_rate=failure_rate,
+        )
         raise RuntimeError(f"Gateway {gateway_name} error: {error_type}")
 
     return {
         "gateway": gateway_name,
         "status": "success",
-        "gateway_transaction_id": f"gtx_{gateway_name}_{int(time.time())}",
-        "latency_ms": round(latency, 2),
+        "gateway_transaction_id": f"gtx_{gateway_name}_{int(time.time())}_{random.randint(1000,9999)}",
+        "latency_ms": round(total_latency, 2),
         "http_status_code": 200,
     }
 
@@ -122,7 +142,7 @@ class GatewayService:
         db: AsyncSession,
     ) -> dict[str, Any]:
         """
-        Execute a payment via the given gateway, wrapped in its circuit breaker.
+        Execute a payment via the given gateway, with circuit breaker integration.
 
         Returns a result dict with:
           - success: bool
@@ -133,27 +153,10 @@ class GatewayService:
         gw = gateway_name.lower()
         start = time.monotonic()
 
-        try:
-            # Execute the async gateway call directly
-            response = await _simulate_gateway_call(gw, transaction_data)
+        # ── Check circuit breaker BEFORE calling ─────────────────────────────
+        if circuit_breakers.is_open(gw):
             latency_ms = (time.monotonic() - start) * 1000
-
-            await _update_gateway_health(db, gw, success=True, latency_ms=latency_ms)
-
-            logger.info(
-                "gateway_call_success",
-                gateway=gw,
-                latency_ms=round(latency_ms, 2),
-            )
-            return {
-                "success": True,
-                "gateway_response": response,
-                "latency_ms": round(latency_ms, 2),
-            }
-
-        except pybreaker.CircuitBreakerError as exc:
-            latency_ms = (time.monotonic() - start) * 1000
-            logger.error("gateway_circuit_open", gateway=gw, error=str(exc))
+            logger.error("gateway_circuit_open", gateway=gw)
             await _update_gateway_health(db, gw, success=False, latency_ms=latency_ms)
             return {
                 "success": False,
@@ -168,8 +171,28 @@ class GatewayService:
                     "timeout_flag": False,
                     "connection_drop_flag": False,
                     "dns_failure_flag": False,
-                    "error": "Circuit breaker is OPEN",
+                    "error": "Circuit breaker is OPEN — gateway unavailable",
                 },
+                "latency_ms": round(latency_ms, 2),
+            }
+
+        try:
+            # Execute the gateway call
+            response = await _simulate_gateway_call(gw, transaction_data)
+            latency_ms = (time.monotonic() - start) * 1000
+
+            # ── Record SUCCESS with circuit breaker ──────────────────────────
+            circuit_breakers.record_success(gw)
+            await _update_gateway_health(db, gw, success=True, latency_ms=latency_ms)
+
+            logger.info(
+                "gateway_call_success",
+                gateway=gw,
+                latency_ms=round(latency_ms, 2),
+            )
+            return {
+                "success": True,
+                "gateway_response": response,
                 "latency_ms": round(latency_ms, 2),
             }
 
@@ -178,22 +201,22 @@ class GatewayService:
             error_msg = str(exc)
             logger.error("gateway_call_failed", gateway=gw, error=error_msg, latency_ms=round(latency_ms, 2))
 
-            # Notify the circuit breaker of this failure via force_open
-            # if the gateway's DB success_rate has dropped below threshold.
-            try:
-                breaker = circuit_breakers.get(gw)
-                # Use pybreaker's internal mechanism safely — just open if needed
-                fail_count = breaker.fail_counter
-                if fail_count >= breaker.fail_max:
-                    breaker.open()
-            except Exception:
-                pass
-
+            # ── Record FAILURE with circuit breaker ──────────────────────────
+            circuit_breakers.record_failure(gw)
             await _update_gateway_health(db, gw, success=False, latency_ms=latency_ms)
 
             timeout = "timeout" in error_msg
             conn_drop = "connection_drop" in error_msg
             dns_fail = "dns_failure" in error_msg
+
+            # Get current health for context
+            try:
+                gw_health = await _get_or_create_gateway_health(db, gw)
+                health_score = gw_health.success_rate
+                success_rate = gw_health.success_rate
+            except Exception:
+                health_score = 0.3
+                success_rate = 0.5
 
             return {
                 "success": False,
@@ -203,8 +226,8 @@ class GatewayService:
                     "http_status_code": 504 if timeout else 503,
                     "gateway_latency_ms": round(latency_ms, 2),
                     "retry_attempts": 1,
-                    "gateway_health_score": 0.3,
-                    "recent_success_rate": 0.5,
+                    "gateway_health_score": health_score,
+                    "recent_success_rate": success_rate,
                     "timeout_flag": timeout,
                     "connection_drop_flag": conn_drop,
                     "dns_failure_flag": dns_fail,

@@ -20,6 +20,37 @@ const PIPELINE_STAGES = [
 ]
 
 const useStore = create((set, get) => ({
+  // ── Auth State ────────────────────────────────────────────────────────
+  authToken: localStorage.getItem('atlas_token') || null,
+  refreshToken: localStorage.getItem('atlas_refresh') || null,
+  user: JSON.parse(localStorage.getItem('atlas_user') || 'null'),
+  isAuthenticated: !!localStorage.getItem('atlas_token'),
+
+  login: (tokenData) => {
+    localStorage.setItem('atlas_token', tokenData.access_token)
+    localStorage.setItem('atlas_refresh', tokenData.refresh_token)
+    const user = { email: tokenData.email, role: tokenData.role }
+    localStorage.setItem('atlas_user', JSON.stringify(user))
+    set({
+      authToken: tokenData.access_token,
+      refreshToken: tokenData.refresh_token,
+      user,
+      isAuthenticated: true,
+    })
+  },
+
+  logout: () => {
+    localStorage.removeItem('atlas_token')
+    localStorage.removeItem('atlas_refresh')
+    localStorage.removeItem('atlas_user')
+    set({
+      authToken: null,
+      refreshToken: null,
+      user: null,
+      isAuthenticated: false,
+    })
+  },
+
   // ── Pipeline State ───────────────────────────────────────────────────
   pipelineStages: PIPELINE_STAGES.map((s) => ({
     ...s,
@@ -94,6 +125,19 @@ const useStore = create((set, get) => ({
   // ── Backend Connection ───────────────────────────────────────────────
   backendConnected: false,
   setBackendConnected: (v) => set({ backendConnected: v }),
+
+  // ── Transactions History ─────────────────────────────────────────────
+  transactions: [],
+  transactionsPage: 1,
+  transactionsTotal: 0,
+  transactionsLoading: false,
+  setTransactions: (data) => set({
+    transactions: data.transactions || [],
+    transactionsPage: data.page || 1,
+    transactionsTotal: data.total || 0,
+    transactionsLoading: false,
+  }),
+  setTransactionsLoading: (v) => set({ transactionsLoading: v }),
 }))
 
 export default useStore

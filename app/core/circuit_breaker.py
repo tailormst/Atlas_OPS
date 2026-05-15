@@ -1,8 +1,8 @@
 """
 Distributed Circuit Breaker for ATLAS-OPS.
 
-One PyBreaker instance per gateway. State is stored in Redis so it is
-shared across multiple Uvicorn workers in Docker.
+One PyBreaker instance per gateway. Provides async-compatible
+success/failure recording and force-open/close for outage simulation.
 """
 import json
 from datetime import datetime, timezone
@@ -18,36 +18,6 @@ settings = get_settings()
 logger = get_logger(__name__)
 
 SUPPORTED_GATEWAYS = ["stripe", "razorpay", "paypal", "square"]
-
-
-class RedisCircuitBreakerStorage(pybreaker.CircuitBreakerStorage):
-    """
-    Redis-backed storage for PyBreaker state.
-    Allows circuit state to be shared across workers.
-    """
-
-    def __init__(self, name: str, redis_pool: aioredis.Redis):
-        super().__init__(name)
-        self._redis = redis_pool
-        self._prefix = f"cb:{name}"
-
-    def _key(self, field: str) -> str:
-        return f"{self._prefix}:{field}"
-
-    # PyBreaker calls these synchronously — we use a sync Redis within
-    # the async pool via run_until_complete in the storage layer.
-    # For simplicity we use the standard synchronous attributes pattern:
-    @property
-    def state(self) -> str:
-        return pybreaker.STATE_CLOSED  # default; overridden by async helper
-
-    @property
-    def counter(self) -> int:
-        return 0
-
-    @property
-    def opened_at(self):
-        return None
 
 
 class GatewayCircuitBreakers:
@@ -76,9 +46,41 @@ class GatewayCircuitBreakers:
             raise ValueError(f"No circuit breaker for gateway: {gateway_name}")
         return self._breakers[name]
 
-    def call(self, gateway_name: str, func: Callable, *args, **kwargs):
-        """Execute func wrapped in the gateway's circuit breaker."""
-        return self.get(gateway_name).call(func, *args, **kwargs)
+    def is_open(self, gateway_name: str) -> bool:
+        """Check if a gateway's circuit breaker is open."""
+        try:
+            breaker = self.get(gateway_name)
+            return breaker.current_state == pybreaker.STATE_OPEN
+        except Exception:
+            return False
+
+    def record_success(self, gateway_name: str) -> None:
+        """Record a successful gateway call. Resets fail counter."""
+        try:
+            breaker = self.get(gateway_name)
+            # Call a no-op function through the breaker to record success
+            breaker.call(lambda: None)
+        except pybreaker.CircuitBreakerError:
+            # Circuit is open — that's fine, we tried
+            pass
+        except Exception as exc:
+            logger.debug("cb_record_success_failed", gateway=gateway_name, error=str(exc))
+
+    def record_failure(self, gateway_name: str) -> None:
+        """Record a failed gateway call. Increments fail counter."""
+        try:
+            breaker = self.get(gateway_name)
+            # Call a function that raises through the breaker to record failure
+            try:
+                breaker.call(lambda: (_ for _ in ()).throw(Exception("gateway_failure")))
+            except pybreaker.CircuitBreakerError:
+                # Circuit just opened — that's expected
+                logger.warning("circuit_breaker_opened_by_failure", gateway=gateway_name)
+            except Exception:
+                # The lambda's exception — expected, breaker counted it
+                pass
+        except Exception as exc:
+            logger.debug("cb_record_failure_failed", gateway=gateway_name, error=str(exc))
 
     def get_all_states(self) -> dict[str, dict]:
         states = {}
@@ -94,14 +96,35 @@ class GatewayCircuitBreakers:
     def force_open(self, gateway_name: str) -> None:
         """Force-open a circuit (for outage simulation)."""
         breaker = self.get(gateway_name)
-        breaker.open()
-        logger.warning("circuit_breaker_force_opened", gateway=gateway_name)
+        # Record enough failures to trigger the circuit breaker to open
+        for _ in range(breaker.fail_max + 2):
+            try:
+                breaker.call(lambda: (_ for _ in ()).throw(Exception("forced_outage")))
+            except (pybreaker.CircuitBreakerError, Exception):
+                pass
+        logger.warning(
+            "circuit_breaker_force_opened",
+            gateway=gateway_name,
+            state=breaker.current_state,
+            fail_counter=breaker.fail_counter,
+        )
 
     def force_close(self, gateway_name: str) -> None:
         """Force-close a circuit (recover from simulation)."""
         breaker = self.get(gateway_name)
-        breaker.close()
-        logger.info("circuit_breaker_force_closed", gateway=gateway_name)
+        # Reset by creating a new breaker with same config
+        new_breaker = pybreaker.CircuitBreaker(
+            fail_max=breaker.fail_max,
+            reset_timeout=breaker.reset_timeout,
+            name=gateway_name,
+            listeners=[CircuitBreakerEventListener(gateway_name)],
+        )
+        self._breakers[gateway_name.lower()] = new_breaker
+        logger.info(
+            "circuit_breaker_force_closed",
+            gateway=gateway_name,
+            state=new_breaker.current_state,
+        )
 
 
 class CircuitBreakerEventListener(pybreaker.CircuitBreakerListener):

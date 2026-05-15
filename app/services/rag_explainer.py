@@ -1,10 +1,9 @@
 """
 RAG Explainer Service for ATLAS-OPS.
 
-Takes SHAP feature contributions + gateway error logs and uses a LangChain
-LLM chain to generate a human-readable failure explanation for the merchant.
-
-Falls back to a template-based explanation if OPENAI_API_KEY is not configured.
+Generates human-readable explanations for transaction outcomes using
+LangChain + OpenAI LLM, with a robust template-based fallback when
+no API key is configured.
 """
 from typing import Any
 
@@ -15,156 +14,239 @@ settings = get_settings()
 logger = get_logger(__name__)
 
 
-# ── Template fallback (used when no API key is configured) ───────────────────
-_FALLBACK_TEMPLATE = """
-Payment Failure Analysis
-========================
-Transaction failed via **{gateway}** with HTTP {http_status}.
-
-**Top Contributing Factors:**
-{top_factors}
-
-**Error Context:**
-- Latency: {latency_ms}ms
-- Retry Attempts: {retries}
-- Timeout: {timeout}
-- Connection Drop: {conn_drop}
-- DNS Failure: {dns_fail}
-
-**Recommendation:** {recommendation}
-""".strip()
-
-_RECOMMENDATIONS = {
-    "timeout": "The gateway timed out. Consider retrying with exponential back-off or switching to an alternative gateway.",
-    "connection_drop": "The connection was dropped mid-flight. This may indicate a network instability issue. Retry or switch to a backup gateway.",
-    "dns_failure": "DNS resolution failed for the gateway endpoint. Contact your infrastructure team to verify DNS configuration.",
-    "high_latency": "Gateway response times are elevated. Consider routing to a lower-latency gateway.",
-    "generic": "The payment could not be processed. Please retry. If the issue persists, contact support.",
-}
-
-
-def _build_template_explanation(
-    shap_values: dict[str, float],
-    gateway_error: dict[str, Any],
-    gateway: str,
-) -> str:
-    """Generate a template-based explanation without an LLM."""
-    top = sorted(shap_values.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
-    top_factors_str = "\n".join(
-        f"  - **{f}**: SHAP = {v:+.4f}" for f, v in top
-    )
-
-    # Determine best recommendation
-    rec_key = "generic"
-    if gateway_error.get("timeout_flag"):
-        rec_key = "timeout"
-    elif gateway_error.get("connection_drop_flag"):
-        rec_key = "connection_drop"
-    elif gateway_error.get("dns_failure_flag"):
-        rec_key = "dns_failure"
-    elif gateway_error.get("gateway_latency_ms", 0) > 2000:
-        rec_key = "high_latency"
-
-    return _FALLBACK_TEMPLATE.format(
-        gateway=gateway.upper(),
-        http_status=gateway_error.get("http_status_code", "N/A"),
-        top_factors=top_factors_str,
-        latency_ms=gateway_error.get("gateway_latency_ms", 0),
-        retries=gateway_error.get("retry_attempts", 0),
-        timeout="Yes" if gateway_error.get("timeout_flag") else "No",
-        conn_drop="Yes" if gateway_error.get("connection_drop_flag") else "No",
-        dns_fail="Yes" if gateway_error.get("dns_failure_flag") else "No",
-        recommendation=_RECOMMENDATIONS[rec_key],
-    )
-
-
-async def _build_llm_explanation(
-    shap_values: dict[str, float],
-    gateway_error: dict[str, Any],
-    gateway: str,
-    transaction_id: str,
-) -> str:
-    """Call OpenAI via LangChain to produce a merchant-friendly explanation."""
-    try:
-        from langchain_openai import ChatOpenAI
-        from langchain.schema import HumanMessage, SystemMessage
-
-        # Format SHAP context
-        top = sorted(shap_values.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
-        shap_context = "\n".join(
-            f"  - {f}: {v:+.4f}" for f, v in top
-        )
-
-        system_prompt = (
-            "You are an expert payment operations analyst. "
-            "Your job is to explain payment failures to merchants in clear, "
-            "non-technical language. Be concise (≤3 paragraphs), actionable, "
-            "and empathetic. Always end with a concrete recommendation."
-        )
-
-        user_prompt = f"""
-A payment transaction (ID: {transaction_id}) failed via the {gateway.upper()} gateway.
-
-Gateway Error Context:
-- HTTP Status: {gateway_error.get('http_status_code', 'N/A')}
-- Latency: {gateway_error.get('gateway_latency_ms', 0)}ms
-- Retry Attempts: {gateway_error.get('retry_attempts', 0)}
-- Timeout: {gateway_error.get('timeout_flag', False)}
-- Connection Drop: {gateway_error.get('connection_drop_flag', False)}
-- DNS Failure: {gateway_error.get('dns_failure_flag', False)}
-
-Top ML Feature Contributions (SHAP values — positive = increases failure risk):
-{shap_context}
-
-Please write a clear explanation for the merchant explaining why this payment failed
-and what they should do next.
-""".strip()
-
-        llm = ChatOpenAI(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key,
-            temperature=0.3,
-            max_tokens=400,
-        )
-
-        messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
-        response = await llm.ainvoke(messages)
-        return response.content
-
-    except Exception as exc:
-        logger.warning("rag_llm_failed", error=str(exc), fallback="template")
-        return _build_template_explanation(shap_values, gateway_error, gateway)
-
-
 class RAGExplainerService:
+    """
+    Provides two entry points:
+      - explain()               → for gateway failures
+      - explain_fraud_rejection() → for fraud rejections
+    """
 
     @staticmethod
     async def explain(
         transaction_id: str,
         shap_values: dict[str, float],
         gateway_error: dict[str, Any],
-        gateway: str = "unknown",
+        gateway: str,
     ) -> str:
-        """
-        Generate a human-readable failure explanation.
+        """Generate explanation for a gateway failure."""
+        # Sort SHAP features by absolute contribution
+        sorted_features = sorted(
+            shap_values.items(), key=lambda x: abs(x[1]), reverse=True
+        )[:5]
 
-        Uses LLM if OPENAI_API_KEY is configured, falls back to template.
+        # Try LLM path if OpenAI key exists
+        if settings.openai_api_key:
+            try:
+                return await _llm_explain_failure(
+                    transaction_id, sorted_features, gateway_error, gateway,
+                )
+            except Exception as exc:
+                logger.warning("llm_explain_failed", error=str(exc))
 
-        Returns:
-            explanation_text (str)
-        """
-        if settings.openai_api_key and settings.openai_api_key.startswith("sk-"):
-            explanation = await _build_llm_explanation(
-                shap_values, gateway_error, gateway, transaction_id
-            )
-        else:
-            logger.info("rag_using_template_fallback", reason="no_api_key")
-            explanation = _build_template_explanation(shap_values, gateway_error, gateway)
-
-        logger.info(
-            "rag_explanation_generated",
-            transaction_id=transaction_id,
-            gateway=gateway,
-            chars=len(explanation),
+        # Template fallback
+        return _template_explain_failure(
+            transaction_id, sorted_features, gateway_error, gateway,
         )
-        return explanation
+
+    @staticmethod
+    async def explain_fraud_rejection(
+        transaction_id: str,
+        fraud_prob: float,
+        shap_values: dict[str, float],
+        features: dict[str, Any],
+    ) -> str:
+        """Generate explanation for a fraud rejection."""
+        sorted_features = sorted(
+            shap_values.items(), key=lambda x: abs(x[1]), reverse=True
+        )[:5]
+
+        if settings.openai_api_key:
+            try:
+                return await _llm_explain_fraud(
+                    transaction_id, fraud_prob, sorted_features, features,
+                )
+            except Exception as exc:
+                logger.warning("llm_explain_fraud_failed", error=str(exc))
+
+        return _template_explain_fraud(
+            transaction_id, fraud_prob, sorted_features, features,
+        )
+
+
+# ── Template Fallbacks ──────────────────────────────────────────────────────
+
+def _template_explain_failure(
+    transaction_id: str,
+    sorted_features: list[tuple[str, float]],
+    gateway_error: dict[str, Any],
+    gateway: str,
+) -> str:
+    """Deterministic, rich explanation for gateway failures."""
+    gw = gateway.upper()
+    error_type = gateway_error.get("error", "Unknown error")
+    latency = gateway_error.get("gateway_latency_ms", 0)
+    http_status = gateway_error.get("http_status_code", 503)
+    timeout = gateway_error.get("timeout_flag", False)
+    conn_drop = gateway_error.get("connection_drop_flag", False)
+    dns_fail = gateway_error.get("dns_failure_flag", False)
+    health = gateway_error.get("gateway_health_score", 0)
+    success_rate = gateway_error.get("recent_success_rate", 0)
+
+    lines = [
+        f"⚠️ Transaction {transaction_id[:8]}... FAILED via {gw} gateway.",
+        "",
+        f"Root Cause: {error_type}",
+        f"HTTP Status: {http_status} | Latency: {latency:.0f}ms",
+    ]
+
+    if timeout:
+        lines.append("• Gateway connection timed out — the external API did not respond within the allowed window.")
+    if conn_drop:
+        lines.append("• Connection was dropped mid-request — possible network instability or gateway overload.")
+    if dns_fail:
+        lines.append("• DNS resolution failed — the gateway hostname could not be resolved.")
+
+    lines.append("")
+    lines.append(f"Gateway Health: {health*100:.0f}% | Recent Success Rate: {success_rate*100:.0f}%")
+
+    if sorted_features:
+        lines.append("")
+        lines.append("Top Contributing Factors (SHAP Analysis):")
+        for feat, val in sorted_features:
+            direction = "↑ increases" if val > 0 else "↓ decreases"
+            lines.append(f"  • {feat}: {val:+.4f} ({direction} failure risk)")
+
+    lines.append("")
+    lines.append("Recommendation: If this gateway continues to fail, enable outage simulation to "
+                 "redirect traffic to alternative gateways. Monitor circuit breaker state in the admin panel.")
+
+    return "\n".join(lines)
+
+
+def _template_explain_fraud(
+    transaction_id: str,
+    fraud_prob: float,
+    sorted_features: list[tuple[str, float]],
+    features: dict[str, Any],
+) -> str:
+    """Deterministic, rich explanation for fraud rejections."""
+    amount = features.get("TransactionAmt", 0)
+    email = features.get("P_emaildomain", "unknown")
+    device = features.get("DeviceInfo", "unknown")
+    dist1 = features.get("dist1", 0)
+
+    lines = [
+        f"🚫 Transaction {transaction_id[:8]}... REJECTED — Fraud probability: {fraud_prob*100:.1f}%",
+        "",
+        f"The AI fraud model determined this transaction has a {fraud_prob*100:.1f}% probability of being fraudulent, "
+        f"which exceeds the {settings.fraud_threshold*100:.0f}% threshold.",
+        "",
+        "Transaction Details:",
+        f"  • Amount: ${amount:,.2f}",
+        f"  • Email Domain: {email}",
+        f"  • Device: {device}",
+        f"  • Distance 1: {dist1:.0f} units",
+    ]
+
+    if sorted_features:
+        lines.append("")
+        lines.append("Top Risk Factors (SHAP Analysis):")
+        for feat, val in sorted_features:
+            if val > 0:
+                lines.append(f"  🔴 {feat}: {val:+.4f} — INCREASES fraud risk")
+            else:
+                lines.append(f"  🟢 {feat}: {val:+.4f} — decreases fraud risk")
+
+    if fraud_prob > 0.9:
+        lines.append("\n⛔ VERY HIGH RISK — This transaction exhibits multiple fraud indicators.")
+    elif fraud_prob > 0.75:
+        lines.append("\n⚠️ HIGH RISK — Significant fraud indicators detected. Manual review recommended.")
+    else:
+        lines.append("\n🔶 MODERATE RISK — Transaction exceeds fraud threshold. Review payment details.")
+
+    return "\n".join(lines)
+
+
+# ── LLM Path ────────────────────────────────────────────────────────────────
+
+async def _llm_explain_failure(
+    transaction_id: str,
+    sorted_features: list[tuple[str, float]],
+    gateway_error: dict[str, Any],
+    gateway: str,
+) -> str:
+    """Use LangChain + OpenAI to generate an explanation."""
+    from langchain_openai import ChatOpenAI
+    from langchain.prompts import ChatPromptTemplate
+
+    llm = ChatOpenAI(
+        model=settings.openai_model or "gpt-4o-mini",
+        api_key=settings.openai_api_key,
+        temperature=0.3,
+        max_tokens=500,
+    )
+
+    features_text = "\n".join(
+        f"  - {f}: {v:+.4f} ({'increases' if v > 0 else 'decreases'} risk)"
+        for f, v in sorted_features
+    )
+
+    prompt = ChatPromptTemplate.from_template(
+        "You are an AI payment operations analyst. "
+        "A transaction (ID: {txn_id}) failed through the {gateway} gateway.\n\n"
+        "Gateway error details:\n{error_json}\n\n"
+        "Top SHAP feature contributions to failure:\n{features}\n\n"
+        "Provide a concise, professional explanation of why the transaction failed "
+        "and what actions the merchant should take. Use bullet points."
+    )
+
+    chain = prompt | llm
+    response = await chain.ainvoke({
+        "txn_id": transaction_id[:8],
+        "gateway": gateway.upper(),
+        "error_json": str(gateway_error),
+        "features": features_text,
+    })
+    return response.content
+
+
+async def _llm_explain_fraud(
+    transaction_id: str,
+    fraud_prob: float,
+    sorted_features: list[tuple[str, float]],
+    features: dict[str, Any],
+) -> str:
+    """Use LangChain + OpenAI to generate a fraud rejection explanation."""
+    from langchain_openai import ChatOpenAI
+    from langchain.prompts import ChatPromptTemplate
+
+    llm = ChatOpenAI(
+        model=settings.openai_model or "gpt-4o-mini",
+        api_key=settings.openai_api_key,
+        temperature=0.3,
+        max_tokens=500,
+    )
+
+    features_text = "\n".join(
+        f"  - {f}: {v:+.4f}" for f, v in sorted_features
+    )
+
+    prompt = ChatPromptTemplate.from_template(
+        "You are an AI fraud analyst. "
+        "A payment transaction (ID: {txn_id}) was REJECTED with fraud score {fraud_pct}%.\n\n"
+        "Transaction features: Amount=${amount}, Email domain={email}, Device={device}\n\n"
+        "Top SHAP risk factors:\n{features}\n\n"
+        "Provide a clear, concise explanation for why this transaction was flagged as fraudulent. "
+        "Use professional language suitable for a merchant dashboard."
+    )
+
+    chain = prompt | llm
+    response = await chain.ainvoke({
+        "txn_id": transaction_id[:8],
+        "fraud_pct": f"{fraud_prob*100:.1f}",
+        "amount": features.get("TransactionAmt", 0),
+        "email": features.get("P_emaildomain", "unknown"),
+        "device": features.get("DeviceInfo", "unknown"),
+        "features": features_text,
+    })
+    return response.content

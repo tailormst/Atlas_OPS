@@ -66,10 +66,11 @@ export default function PipelineView() {
     routingConfidence: pipelineStages[7]?.data?.confidence,
     circuitState: pipelineStages[8]?.data?.circuit_state,
     gatewayLatency: pipelineStages[9]?.data?.latency_ms || pipelineStages[10]?.data?.latency_ms,
-    shapValues: pipelineStages[12]?.data?.fraud_shap || pipelineStages[12]?.data?.shap_values,
+    shapValues: pipelineStages[12]?.data?.shap_values || pipelineStages[12]?.data?.fraud_shap,
     explanation: pipelineStages[13]?.data?.explanation,
     finalStatus: pipelineStages[15]?.data?.status,
     elapsed: pipelineStages[15]?.data?.elapsed_ms,
+    reroutedFrom: pipelineStages[15]?.data?.rerouted_from,
   }
 
   return (

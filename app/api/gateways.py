@@ -30,6 +30,7 @@ logger = get_logger(__name__)
 )
 async def get_gateways_health(db: AsyncSession = Depends(get_db)):
     health_records = await GatewayService.get_all_health(db)
+    await db.commit()
     cb_states = circuit_breakers.get_all_states()
 
     items = []

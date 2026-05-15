@@ -5,29 +5,54 @@ Creates the 'atlas_ops' database if it doesn't exist.
 Usage:
     python setup_db.py
 
-Requires psycopg2: pip install psycopg2-binary
+Requires:
+    pip install psycopg2-binary python-dotenv
 """
+
+import os
 import sys
+from urllib.parse import urlparse
+
+from dotenv import load_dotenv
+
 
 def setup_database():
     try:
         import psycopg2
         from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
     except ImportError:
-        print("ERROR: psycopg2 not installed. Run: pip install psycopg2-binary")
+        print("ERROR: psycopg2 not installed.")
+        print("Run: pip install psycopg2-binary")
         sys.exit(1)
 
-    # ── Connection settings (match your pgAdmin setup) ──────────────────────
-    DB_HOST = "localhost"
-    DB_PORT = 5432
-    DB_USER = "postgres"        # Change if your pgAdmin user is different
-    DB_PASSWORD = "password"    # Change to your actual PostgreSQL password
-    DB_NAME = "atlas_ops"
+    # Load .env file
+    load_dotenv()
+
+    # Read DATABASE_URL from .env
+    database_url = os.getenv("DATABASE_URL")
+
+    if not database_url:
+        print("❌ DATABASE_URL not found in .env")
+        sys.exit(1)
+
+    # Parse DATABASE_URL
+    # Example:
+    # postgresql+asyncpg://postgres:password@localhost:5432/atlas_ops
+
+    parsed = urlparse(
+        database_url.replace("postgresql+asyncpg", "postgresql")
+    )
+
+    DB_HOST = parsed.hostname or "localhost"
+    DB_PORT = parsed.port or 5432
+    DB_USER = parsed.username
+    DB_PASSWORD = parsed.password
+    DB_NAME = parsed.path.lstrip("/")
 
     print(f"Connecting to PostgreSQL at {DB_HOST}:{DB_PORT} as '{DB_USER}'...")
 
     try:
-        # Connect to default 'postgres' database to create our database
+        # Connect to default postgres DB first
         conn = psycopg2.connect(
             host=DB_HOST,
             port=DB_PORT,
@@ -35,13 +60,16 @@ def setup_database():
             password=DB_PASSWORD,
             database="postgres",
         )
+
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cursor = conn.cursor()
 
-        # Check if database exists
+        # Check if DB already exists
         cursor.execute(
-            "SELECT 1 FROM pg_catalog.pg_database WHERE datname = %s", (DB_NAME,)
+            "SELECT 1 FROM pg_catalog.pg_database WHERE datname = %s",
+            (DB_NAME,),
         )
+
         exists = cursor.fetchone()
 
         if exists:
@@ -53,7 +81,7 @@ def setup_database():
         cursor.close()
         conn.close()
 
-        # Verify connection to the new database
+        # Verify connection to created DB
         conn2 = psycopg2.connect(
             host=DB_HOST,
             port=DB_PORT,
@@ -61,16 +89,21 @@ def setup_database():
             password=DB_PASSWORD,
             database=DB_NAME,
         )
+
         conn2.close()
+
         print(f"✅ Successfully connected to '{DB_NAME}'.")
-        print(f"\nDatabase URL for .env:")
-        print(f"  DATABASE_URL=postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
 
     except psycopg2.OperationalError as e:
-        print(f"\n❌ Could not connect to PostgreSQL!")
-        print(f"   Error: {e}")
-        print(f"\n   Ensure PostgreSQL is running and credentials are correct.")
-        print(f"   Check pgAdmin → Server → Properties for host/port/username.")
+        print("\n❌ Could not connect to PostgreSQL!")
+        print(f"Error: {e}")
+
+        print("\nCheck the following:")
+        print("- PostgreSQL service is running")
+        print("- Username/password in .env are correct")
+        print("- Port is correct")
+        print("- pgAdmin/PostgreSQL is installed properly")
+
         sys.exit(1)
 
 

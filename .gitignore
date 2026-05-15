@@ -54,3 +54,8 @@ coverage.xml
 *.bak
 *.tmp
 .gemini/
+
+venv/
+__pycache__/
+.env
+*.pyc

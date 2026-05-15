@@ -174,4 +174,4 @@ This project is open-source and available under the MIT License.
 
 ## Support
 
-For questions, open an issue in [GitHub Issues](https://github.com/tailormst/Atlas_OPS/issues).
+For any questions, open an issue in [GitHub Issues](https://github.com/tailormst/Atlas_OPS/issues).
